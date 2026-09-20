@@ -27,7 +27,7 @@ def health():
         "healthy": True,
         "service": APP_NAME,
         "version": APP_VERSION,
-        "timestamp": datetime.datetime.utcnow.isoformat()
+        "timestamp": datetime.datetime.utcnow().isoformat()
     }), 200
 
 @app.route('/metrics')
