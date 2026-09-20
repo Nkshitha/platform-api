@@ -1,0 +1,145 @@
+name: CI/CD Pipeline
+
+on: 
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  APP_NAME: platform-api
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install flask pytest -r app/requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short
+
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test container health
+        run: |
+          docker build -t ${{ env.APP_NAME }}:test .
+          docker run -d \
+            --name api-test \
+            -p 5000:5000 \
+            ${{ env.APP_NAME }}:test
+          sleep 10
+        curl -f http://localhost:5000/health
+        curl -f http://localhost:5000/ready
+        docker stop api-test
+        docker rm api-test
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build image for scanning
+        run: docker build -t ${{ env.APP_NAME }}:scan
+
+      - name: Run trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.APP_NAME }}:scan
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: [test, build, security]
+    if: github.ref == 'refs/head/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@1.8.0
+        with:
+          cluster_name: platform
+
+      - name: Build and load image to kind
+        run:
+          docker build -t ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }} .
+          docker tag \
+            ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }} \
+            ${{ env.APP_NAME }}:latest
+          kind load docker-image \
+            ${{ env.APP_NAME }}.latest \
+            --name platform
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status \
+            deployment/platform-api \
+            -n platform \
+            --timeout=120s
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n platform
+          POD=$(kubectl get pods -n platform \
+            -l app=platform-api \
+            -o jsonpath='{.item[0].metadata.name}')
+          kubectl exec $POD \
+            -n platform -- \
+            python3 -c"
+          import urllib.request
+        r = urllib.request.urlopen('http://localhost:5000/health')
+        print('Health check:', r.status)
+        assert r.status == 200
+        print('Deployment verified')
+
+      - name: Show deployment summary
+        run: |
+          echo "==========================="
+          echo "Deployment successful"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "=============================="
+          kubectl get all -n platform
